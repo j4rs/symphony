@@ -755,6 +755,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
            }
 
     assert config.codex.thread_sandbox == "workspace-write"
+    assert config.codex.workspace_writable_subpaths == []
 
     assert {:ok, canonical_default_workspace_root} =
              SymphonyElixir.PathSafety.canonicalize(Path.join(System.tmp_dir!(), "symphony_workspaces"))
@@ -810,6 +811,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              "writableRoots" => [explicit_workspace, explicit_cache]
            }
 
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_workspace_writable_subpaths: [".git", "tmp/cache"]
+    )
+
+    assert Config.settings!().codex.workspace_writable_subpaths == [".git", "tmp/cache"]
+
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: ",")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "tracker.active_states"
@@ -833,6 +840,20 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), codex_stall_timeout_ms: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.stall_timeout_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_workspace_writable_subpaths: ["/etc/passwd"]
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.workspace_writable_subpaths"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_workspace_writable_subpaths: ["../escape"]
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.workspace_writable_subpaths"
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},

@@ -34,6 +34,10 @@ codex:
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+  # Re-grant write access to paths the Codex sandbox protects by default,
+  # resolved against each turn's cwd. `.git` lets the agent run git merge/rebase.
+  # workspace_writable_subpaths:
+  #   - .git
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`

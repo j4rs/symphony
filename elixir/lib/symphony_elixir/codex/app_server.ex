@@ -316,7 +316,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "cwd" => workspace,
         "title" => "#{issue.identifier}: #{issue.title}",
         "approvalPolicy" => approval_policy,
-        "sandboxPolicy" => turn_sandbox_policy
+        "sandboxPolicy" => augment_writable_roots(turn_sandbox_policy, workspace)
       }
     })
 
@@ -325,6 +325,25 @@ defmodule SymphonyElixir.Codex.AppServer do
       other -> other
     end
   end
+
+  # Add the configured workspace-relative subpaths (resolved against the turn
+  # cwd) to the policy's writable roots. codex's workspace-write sandbox marks
+  # the repo's `.git` read-only by default, blocking merge/rebase; an operator
+  # opts paths back in via `codex.workspace_writable_subpaths` in WORKFLOW.md.
+  # Policies without writable roots (e.g. dangerFullAccess) are left untouched.
+  defp augment_writable_roots(%{"writableRoots" => roots} = policy, workspace)
+       when is_list(roots) and is_binary(workspace) do
+    case Config.settings!().codex.workspace_writable_subpaths do
+      subpaths when is_list(subpaths) and subpaths != [] ->
+        extra = Enum.map(subpaths, &Path.join(workspace, &1))
+        Map.put(policy, "writableRoots", Enum.uniq(roots ++ extra))
+
+      _ ->
+        policy
+    end
+  end
+
+  defp augment_writable_roots(policy, _workspace), do: policy
 
   defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
     receive_loop(

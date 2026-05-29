@@ -171,6 +171,12 @@ defmodule SymphonyElixir.Config.Schema do
 
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
+      # Workspace-relative paths to add to the turn sandbox policy's writable
+      # roots, resolved against each turn's cwd. codex's workspace-write sandbox
+      # marks the repo's `.git` directory read-only by default, which blocks
+      # `git merge`/`rebase`; an operator can opt a path back in here (e.g.
+      # `[".git"]`) without weakening the rest of the sandbox.
+      field(:workspace_writable_subpaths, {:array, :string}, default: [])
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
@@ -186,6 +192,7 @@ defmodule SymphonyElixir.Config.Schema do
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
+          :workspace_writable_subpaths,
           :turn_timeout_ms,
           :read_timeout_ms,
           :stall_timeout_ms
@@ -193,9 +200,33 @@ defmodule SymphonyElixir.Config.Schema do
         empty_values: []
       )
       |> validate_required([:command])
+      |> validate_workspace_writable_subpaths()
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    end
+
+    # Each entry must be a non-empty workspace-relative path that stays inside
+    # the workspace, so resolving it against the turn cwd can never widen the
+    # sandbox to an absolute location or escape via "..".
+    defp validate_workspace_writable_subpaths(changeset) do
+      validate_change(changeset, :workspace_writable_subpaths, fn :workspace_writable_subpaths, subpaths ->
+        Enum.flat_map(List.wrap(subpaths), fn subpath ->
+          cond do
+            not is_binary(subpath) or subpath == "" ->
+              [{:workspace_writable_subpaths, "entries must be non-empty strings"}]
+
+            Path.type(subpath) != :relative ->
+              [{:workspace_writable_subpaths, "entries must be workspace-relative paths, got #{inspect(subpath)}"}]
+
+            ".." in Path.split(subpath) ->
+              [{:workspace_writable_subpaths, "entries must not escape the workspace with \"..\", got #{inspect(subpath)}"}]
+
+            true ->
+              []
+          end
+        end)
+      end)
     end
   end
 

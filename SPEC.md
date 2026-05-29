@@ -446,6 +446,13 @@ fields locally if they want stricter startup checks.
   - Default: implementation-defined.
 - `turn_sandbox_policy` (Codex `SandboxPolicy` value)
   - Default: implementation-defined.
+- `workspace_writable_subpaths` (array of strings)
+  - Workspace-relative paths added to the turn sandbox policy's writable roots,
+    resolved against each turn's `cwd`. Lets an operator re-grant write access to
+    a path the Codex sandbox protects by default (e.g. `.git`, so the agent can
+    `git merge`/`rebase`) without widening the rest of the sandbox. Entries must
+    be relative and must not escape the workspace via `..`.
+  - Default: `[]`
 - `turn_timeout_ms` (integer)
   - Default: `3600000` (1 hour)
 - `read_timeout_ms` (integer)
@@ -591,6 +598,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
+- `codex.workspace_writable_subpaths`: array of workspace-relative strings added to the turn sandbox policy's writable roots (resolved against the turn `cwd`), default `[]`
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
