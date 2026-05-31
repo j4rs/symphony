@@ -356,7 +356,13 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
-                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+                 "tokens" => %{
+                   "input_tokens" => 4,
+                   "cached_input_tokens" => 3,
+                   "uncached_input_tokens" => 1,
+                   "output_tokens" => 8,
+                   "total_tokens" => 12
+                 }
                }
              ],
              "retrying" => [
@@ -387,6 +393,8 @@ defmodule SymphonyElixir.ExtensionsTest do
              ],
              "codex_totals" => %{
                "input_tokens" => 4,
+               "cached_input_tokens" => 3,
+               "uncached_input_tokens" => 1,
                "output_tokens" => 8,
                "total_tokens" => 12,
                "seconds_running" => 42.5
@@ -416,7 +424,13 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_event" => "notification",
                "last_message" => "rendered",
                "last_event_at" => nil,
-               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+               "tokens" => %{
+                 "input_tokens" => 4,
+                 "cached_input_tokens" => 3,
+                 "uncached_input_tokens" => 1,
+                 "output_tokens" => 8,
+                 "total_tokens" => 12
+               }
              },
              "retry" => nil,
              "blocked" => nil,
@@ -727,6 +741,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           last_codex_timestamp: nil,
           last_codex_event: :notification,
           codex_input_tokens: 4,
+          codex_cached_input_tokens: 3,
           codex_output_tokens: 8,
           codex_total_tokens: 12,
           started_at: DateTime.utc_now()
@@ -760,7 +775,13 @@ defmodule SymphonyElixir.ExtensionsTest do
           last_codex_timestamp: DateTime.utc_now()
         }
       ],
-      codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
+      codex_totals: %{
+        input_tokens: 4,
+        cached_input_tokens: 3,
+        output_tokens: 8,
+        total_tokens: 12,
+        seconds_running: 42.5
+      },
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }
   end

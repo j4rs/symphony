@@ -103,6 +103,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-detail numeric">
               In <%= format_int(@payload.codex_totals.input_tokens) %> / Out <%= format_int(@payload.codex_totals.output_tokens) %>
             </p>
+            <p class="metric-detail numeric">
+              Fresh <%= format_int(Map.get(@payload.codex_totals, :uncached_input_tokens, 0)) %> / Cached <%= format_int(Map.get(@payload.codex_totals, :cached_input_tokens, 0)) %>
+            </p>
           </article>
 
           <article class="metric-card">
@@ -203,6 +206,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <div class="token-stack numeric">
                         <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
                         <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                        <span class="muted">Fresh <%= format_int(Map.get(entry.tokens, :uncached_input_tokens, 0)) %> / Cached <%= format_int(Map.get(entry.tokens, :cached_input_tokens, 0)) %></span>
                       </div>
                     </td>
                   </tr>

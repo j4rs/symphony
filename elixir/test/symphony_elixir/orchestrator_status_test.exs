@@ -137,9 +137,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_timestamp: nil,
       last_codex_event: nil,
       codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
       codex_output_tokens: 0,
       codex_total_tokens: 0,
       codex_last_reported_input_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
       codex_last_reported_output_tokens: 0,
       codex_last_reported_total_tokens: 0,
       started_at: started_at
@@ -234,9 +236,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_timestamp: nil,
       last_codex_event: nil,
       codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
       codex_output_tokens: 0,
       codex_total_tokens: 0,
       codex_last_reported_input_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
       codex_last_reported_output_tokens: 0,
       codex_last_reported_total_tokens: 0,
       started_at: started_at
@@ -255,7 +259,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
          event: :turn_completed,
          payload: %{
            method: "turn/completed",
-           usage: %{"input_tokens" => "12", "output_tokens" => 4, "total_tokens" => 16}
+           usage: %{
+             "input_tokens" => "12",
+             "cached_input_tokens" => 9,
+             "output_tokens" => 4,
+             "total_tokens" => 16
+           }
          },
          timestamp: DateTime.utc_now()
        }}
@@ -264,12 +273,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     snapshot = GenServer.call(pid, :snapshot)
     assert %{running: [snapshot_entry]} = snapshot
     assert snapshot_entry.codex_input_tokens == 12
+    assert snapshot_entry.codex_cached_input_tokens == 9
     assert snapshot_entry.codex_output_tokens == 4
     assert snapshot_entry.codex_total_tokens == 16
 
     send(pid, {:DOWN, process_ref, :process, self(), :normal})
     completed_state = :sys.get_state(pid)
     assert completed_state.codex_totals.input_tokens == 12
+    assert completed_state.codex_totals.cached_input_tokens == 9
     assert completed_state.codex_totals.output_tokens == 4
     assert completed_state.codex_totals.total_tokens == 16
   end
@@ -309,9 +320,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_timestamp: nil,
       last_codex_event: nil,
       codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
       codex_output_tokens: 0,
       codex_total_tokens: 0,
       codex_last_reported_input_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
       codex_last_reported_output_tokens: 0,
       codex_last_reported_total_tokens: 0,
       started_at: started_at
@@ -422,9 +435,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_timestamp: nil,
       last_codex_event: nil,
       codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
       codex_output_tokens: 0,
       codex_total_tokens: 0,
       codex_last_reported_input_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
       codex_last_reported_output_tokens: 0,
       codex_last_reported_total_tokens: 0,
       started_at: started_at
@@ -503,9 +518,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_timestamp: nil,
       last_codex_event: nil,
       codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
       codex_output_tokens: 0,
       codex_total_tokens: 0,
       codex_last_reported_input_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
       codex_last_reported_output_tokens: 0,
       codex_last_reported_total_tokens: 0,
       started_at: started_at
@@ -591,9 +608,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_timestamp: nil,
       last_codex_event: nil,
       codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
       codex_output_tokens: 0,
       codex_total_tokens: 0,
       codex_last_reported_input_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
       codex_last_reported_output_tokens: 0,
       codex_last_reported_total_tokens: 0,
       started_at: started_at
@@ -665,9 +684,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_timestamp: nil,
       last_codex_event: nil,
       codex_input_tokens: 0,
+      codex_cached_input_tokens: 0,
       codex_output_tokens: 0,
       codex_total_tokens: 0,
       codex_last_reported_input_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
       codex_last_reported_output_tokens: 0,
       codex_last_reported_total_tokens: 0,
       started_at: started_at
