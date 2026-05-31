@@ -21,7 +21,7 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
-          codex_totals: snapshot.codex_totals,
+          codex_totals: codex_totals_payload(snapshot.codex_totals),
           rate_limits: snapshot.rate_limits
         }
 
@@ -114,11 +114,28 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event_at: iso8601(entry.last_codex_timestamp),
       tokens: %{
         input_tokens: entry.codex_input_tokens,
+        cached_input_tokens: Map.get(entry, :codex_cached_input_tokens, 0),
+        uncached_input_tokens:
+          max(entry.codex_input_tokens - Map.get(entry, :codex_cached_input_tokens, 0), 0),
         output_tokens: entry.codex_output_tokens,
         total_tokens: entry.codex_total_tokens
       }
     }
   end
+
+  # Enrich the aggregate token totals with derived uncached (= input - cached)
+  # input. Uncached + output is the real-cost signal; gross input is mostly cache
+  # hits on the repeated prompt prefix.
+  defp codex_totals_payload(totals) when is_map(totals) do
+    input = Map.get(totals, :input_tokens, 0)
+    cached = Map.get(totals, :cached_input_tokens, 0)
+
+    totals
+    |> Map.put_new(:cached_input_tokens, cached)
+    |> Map.put(:uncached_input_tokens, max(input - cached, 0))
+  end
+
+  defp codex_totals_payload(other), do: other
 
   defp retry_entry_payload(entry) do
     %{
@@ -161,6 +178,9 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event_at: iso8601(running.last_codex_timestamp),
       tokens: %{
         input_tokens: running.codex_input_tokens,
+        cached_input_tokens: Map.get(running, :codex_cached_input_tokens, 0),
+        uncached_input_tokens:
+          max(running.codex_input_tokens - Map.get(running, :codex_cached_input_tokens, 0), 0),
         output_tokens: running.codex_output_tokens,
         total_tokens: running.codex_total_tokens
       }
