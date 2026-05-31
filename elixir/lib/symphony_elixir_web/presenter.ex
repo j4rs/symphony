@@ -115,8 +115,7 @@ defmodule SymphonyElixirWeb.Presenter do
       tokens: %{
         input_tokens: entry.codex_input_tokens,
         cached_input_tokens: Map.get(entry, :codex_cached_input_tokens, 0),
-        uncached_input_tokens:
-          max(entry.codex_input_tokens - Map.get(entry, :codex_cached_input_tokens, 0), 0),
+        uncached_input_tokens: max(entry.codex_input_tokens - Map.get(entry, :codex_cached_input_tokens, 0), 0),
         output_tokens: entry.codex_output_tokens,
         total_tokens: entry.codex_total_tokens
       }
@@ -179,8 +178,7 @@ defmodule SymphonyElixirWeb.Presenter do
       tokens: %{
         input_tokens: running.codex_input_tokens,
         cached_input_tokens: Map.get(running, :codex_cached_input_tokens, 0),
-        uncached_input_tokens:
-          max(running.codex_input_tokens - Map.get(running, :codex_cached_input_tokens, 0), 0),
+        uncached_input_tokens: max(running.codex_input_tokens - Map.get(running, :codex_cached_input_tokens, 0), 0),
         output_tokens: running.codex_output_tokens,
         total_tokens: running.codex_total_tokens
       }

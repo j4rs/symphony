@@ -1464,8 +1464,7 @@ defmodule SymphonyElixir.Orchestrator do
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
         codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
-        codex_last_reported_cached_input_tokens:
-          max(last_reported_cached, token_delta.cached_input_reported),
+        codex_last_reported_cached_input_tokens: max(last_reported_cached, token_delta.cached_input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
