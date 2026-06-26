@@ -66,10 +66,22 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil
     }
 
-    run_terminal_workspace_cleanup()
     state = schedule_tick(state, 0)
 
-    {:ok, state}
+    # Run the startup workspace sweep via {:continue, ...} rather than inline:
+    # init/1 returns immediately (so the supervisor can start the HTTP server,
+    # which it boots *after* this process — an inline sweep kept the dashboard
+    # down for the whole reap), while handle_continue/2 still runs the sweep as
+    # this process's first action, *before* any :tick is handled. Cleanup
+    # therefore stays serialized ahead of dispatch exactly as before — no risk of
+    # reaping a workspace that concurrent dispatch just re-created.
+    {:ok, state, {:continue, :run_terminal_workspace_cleanup}}
+  end
+
+  @impl true
+  def handle_continue(:run_terminal_workspace_cleanup, state) do
+    run_terminal_workspace_cleanup()
+    {:noreply, state}
   end
 
   @impl true
