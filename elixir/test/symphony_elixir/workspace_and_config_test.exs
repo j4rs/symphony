@@ -429,33 +429,38 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
   end
 
-  test "linear client logs response bodies for non-200 graphql responses" do
-    log =
-      ExUnit.CaptureLog.capture_log(fn ->
-        assert {:error, {:linear_api_status, 400}} =
-                 Client.graphql(
-                   "query Viewer { viewer { id } }",
-                   %{},
-                   request_fun: fn _payload, _headers ->
-                     {:ok,
-                      %{
-                        status: 400,
-                        body: %{
-                          "errors" => [
-                            %{
-                              "message" => "Variable \"$ids\" got invalid value",
-                              "extensions" => %{"code" => "BAD_USER_INPUT"}
-                            }
-                          ]
-                        }
-                      }}
-                   end
-                 )
+  test "linear client logs and returns response bodies for non-200 graphql responses" do
+    {result, log} =
+      ExUnit.CaptureLog.with_log(fn ->
+        Client.graphql(
+          "query Viewer { viewer { id } }",
+          %{},
+          request_fun: fn _payload, _headers ->
+            {:ok,
+             %{
+               status: 400,
+               body: %{
+                 "errors" => [
+                   %{
+                     "message" => "Variable \"$ids\" got invalid value",
+                     "extensions" => %{"code" => "BAD_USER_INPUT"}
+                   }
+                 ]
+               }
+             }}
+          end
+        )
       end)
 
     assert log =~ "Linear GraphQL request failed status=400"
     assert log =~ ~s(body=%{"errors" => [%{"extensions" => %{"code" => "BAD_USER_INPUT"})
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
+
+    # The body must reach the caller, not just the log — the agent behind
+    # `linear_graphql` cannot read Symphony's logs.
+    assert {:error, {:linear_api_status, 400, %{"errors" => [returned_error]}}} = result
+    assert returned_error["message"] == "Variable \"$ids\" got invalid value"
+    assert returned_error["extensions"] == %{"code" => "BAD_USER_INPUT"}
   end
 
   test "orchestrator sorts dispatch by priority then oldest created_at" do
