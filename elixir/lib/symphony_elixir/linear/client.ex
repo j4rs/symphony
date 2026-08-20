@@ -176,7 +176,12 @@ defmodule SymphonyElixir.Linear.Client do
             linear_error_context(payload, response)
         )
 
-        {:error, {:linear_api_status, response.status}}
+        # Carry the body, not just the status. Linear answers a malformed document
+        # with HTTP 400 whose body names the exact bad field ("Field \"id\" is not
+        # defined by type \"CommentUpdateInput\"."). Dropping it leaves the caller —
+        # in practice the agent behind `linear_graphql` — with a bare "HTTP 400" and
+        # nothing to correct, so it reshapes the query blindly or escalates to a human.
+        {:error, {:linear_api_status, response.status, response.body}}
 
       {:error, reason} ->
         Logger.error("Linear GraphQL request failed: #{inspect(reason)}")

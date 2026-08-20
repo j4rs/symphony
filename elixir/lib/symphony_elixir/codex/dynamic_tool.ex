@@ -26,6 +26,12 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   }
 
+  # Bound what an error body can add to the agent's context. Linear's validation
+  # messages are short; a runaway body (an HTML error page, a huge errors array)
+  # must not become the firehose this tool exists to avoid.
+  @max_error_text_chars 1_000
+  @max_reported_errors 10
+
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
     case tool do
@@ -176,6 +182,17 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
+  defp tool_error_payload({:linear_api_status, status, body}) do
+    %{
+      "error" =>
+        %{
+          "message" => "Linear GraphQL request failed with HTTP #{status}.",
+          "status" => status
+        }
+        |> Map.merge(error_body_details(body))
+    }
+  end
+
   defp tool_error_payload({:linear_api_status, status}) do
     %{
       "error" => %{
@@ -201,6 +218,53 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "reason" => inspect(reason)
       }
     }
+  end
+
+  # Linear reports a rejected document as a GraphQL `errors` array even on a
+  # non-200. Prefer those messages; fall back to the raw body for anything else
+  # (gateway HTML, an unexpected envelope).
+  defp error_body_details(%{"errors" => errors}) when is_list(errors) and errors != [] do
+    %{"errors" => errors |> Enum.take(@max_reported_errors) |> Enum.map(&normalize_graphql_error/1)}
+  end
+
+  defp error_body_details(body) when is_binary(body) do
+    case String.trim(body) do
+      "" -> %{}
+      trimmed -> %{"body" => truncate_error_text(trimmed)}
+    end
+  end
+
+  defp error_body_details(body) when is_map(body) or is_list(body) do
+    case Jason.encode(body) do
+      {:ok, encoded} -> %{"body" => truncate_error_text(encoded)}
+      {:error, _reason} -> %{}
+    end
+  end
+
+  defp error_body_details(_body), do: %{}
+
+  defp normalize_graphql_error(%{} = error) do
+    details = %{"message" => error_message_text(Map.get(error, "message"))}
+
+    case Map.get(error, "extensions") do
+      %{"code" => code} when is_binary(code) -> Map.put(details, "code", code)
+      _ -> details
+    end
+  end
+
+  defp normalize_graphql_error(error), do: %{"message" => truncate_error_text(inspect(error))}
+
+  defp error_message_text(message) when is_binary(message), do: truncate_error_text(message)
+  defp error_message_text(message), do: truncate_error_text(inspect(message))
+
+  # Slice by graphemes, not bytes: a byte-split of a multi-byte character would
+  # produce invalid UTF-8 and blow up the Jason encode that renders this payload.
+  defp truncate_error_text(text) when is_binary(text) do
+    if String.length(text) > @max_error_text_chars do
+      String.slice(text, 0, @max_error_text_chars) <> "...<truncated>"
+    else
+      text
+    end
   end
 
   defp supported_tool_names do

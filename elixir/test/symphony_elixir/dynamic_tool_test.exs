@@ -278,6 +278,102 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
            }
   end
 
+  test "linear_graphql surfaces Linear's validation errors so the agent can correct the document" do
+    # Verbatim shape of the 400 that blocked GET-248: the message names the exact
+    # misplaced field, which is the whole reason the agent needs to see it.
+    body = %{
+      "errors" => [
+        %{
+          "message" => "Field \"id\" is not defined by type \"CommentUpdateInput\".",
+          "extensions" => %{"code" => "GRAPHQL_VALIDATION_FAILED"}
+        },
+        %{
+          "message" => "Field \"commentUpdate\" argument \"id\" of type \"String!\" is required, but it was not provided.",
+          "extensions" => %{"code" => "GRAPHQL_VALIDATION_FAILED"}
+        }
+      ]
+    }
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "mutation { commentUpdate(input: { id: \"x\", body: \"y\" }) { success } }"},
+        linear_client: fn _query, _variables, _opts -> {:error, {:linear_api_status, 400, body}} end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "Linear GraphQL request failed with HTTP 400.",
+               "status" => 400,
+               "errors" => [
+                 %{
+                   "message" => "Field \"id\" is not defined by type \"CommentUpdateInput\".",
+                   "code" => "GRAPHQL_VALIDATION_FAILED"
+                 },
+                 %{
+                   "message" => "Field \"commentUpdate\" argument \"id\" of type \"String!\" is required, but it was not provided.",
+                   "code" => "GRAPHQL_VALIDATION_FAILED"
+                 }
+               ]
+             }
+           }
+  end
+
+  test "linear_graphql falls back to the raw body when it is not a graphql errors envelope" do
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        linear_client: fn _query, _variables, _opts ->
+          {:error, {:linear_api_status, 503, "upstream connect error or disconnect/reset before headers"}}
+        end
+      )
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "Linear GraphQL request failed with HTTP 503.",
+               "status" => 503,
+               "body" => "upstream connect error or disconnect/reset before headers"
+             }
+           }
+  end
+
+  test "linear_graphql bounds an oversized error body and survives multi-byte characters" do
+    # Slicing by bytes here would split the final character and produce invalid
+    # UTF-8, which Jason.encode!/1 would reject.
+    oversized = String.duplicate("é", 5_000)
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        linear_client: fn _query, _variables, _opts -> {:error, {:linear_api_status, 400, oversized}} end
+      )
+
+    assert %{"error" => %{"body" => reported}} = Jason.decode!(response["output"])
+    assert String.ends_with?(reported, "...<truncated>")
+    assert String.length(reported) == 1_000 + String.length("...<truncated>")
+    assert String.valid?(reported)
+  end
+
+  test "linear_graphql still formats a bare status error without a body" do
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        linear_client: fn _query, _variables, _opts -> {:error, {:linear_api_status, 500, ""}} end
+      )
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "Linear GraphQL request failed with HTTP 500.",
+               "status" => 500
+             }
+           }
+  end
+
   test "linear_graphql formats unexpected failures from the client" do
     response =
       DynamicTool.execute(
