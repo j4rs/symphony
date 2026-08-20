@@ -358,6 +358,31 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert String.valid?(reported)
   end
 
+  test "linear_graphql bounds extensions.code as well as the message" do
+    # `code` is attacker-adjacent in the same way `message` is: it comes straight
+    # off the wire, so it has to share the same cap or the bound is decorative.
+    body = %{
+      "errors" => [
+        %{
+          "message" => "boom",
+          "extensions" => %{"code" => String.duplicate("é", 5_000)}
+        }
+      ]
+    }
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        linear_client: fn _query, _variables, _opts -> {:error, {:linear_api_status, 400, body}} end
+      )
+
+    assert %{"error" => %{"errors" => [%{"code" => reported_code}]}} = Jason.decode!(response["output"])
+    assert String.ends_with?(reported_code, "...<truncated>")
+    assert String.length(reported_code) == 1_000 + String.length("...<truncated>")
+    assert String.valid?(reported_code)
+  end
+
   test "linear_graphql still formats a bare status error without a body" do
     response =
       DynamicTool.execute(

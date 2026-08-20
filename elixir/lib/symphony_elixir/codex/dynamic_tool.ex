@@ -247,7 +247,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     details = %{"message" => error_message_text(Map.get(error, "message"))}
 
     case Map.get(error, "extensions") do
-      %{"code" => code} when is_binary(code) -> Map.put(details, "code", code)
+      %{"code" => code} when is_binary(code) -> Map.put(details, "code", truncate_error_text(code))
       _ -> details
     end
   end
