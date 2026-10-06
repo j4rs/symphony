@@ -14,6 +14,10 @@ defmodule SymphonyElixir.Orchestrator do
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  # Issues usually reach a terminal state while Symphony isn't tracking them
+  # (agent -> Human Review -> human merges -> Done), so the boot sweep alone
+  # leaves their workspaces and isolated databases behind until the next restart.
+  @terminal_workspace_sweep_interval_ms 30 * 60 * 1_000
   @empty_codex_totals %{
     input_tokens: 0,
     cached_input_tokens: 0,
@@ -40,7 +44,9 @@ defmodule SymphonyElixir.Orchestrator do
       blocked: %{},
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      terminal_sweep_pid: nil,
+      terminal_sweep_claims: MapSet.new()
     ]
   end
 
@@ -81,6 +87,7 @@ defmodule SymphonyElixir.Orchestrator do
   @impl true
   def handle_continue(:run_terminal_workspace_cleanup, state) do
     run_terminal_workspace_cleanup()
+    schedule_terminal_workspace_sweep()
     {:noreply, state}
   end
 
@@ -128,6 +135,44 @@ defmodule SymphonyElixir.Orchestrator do
 
     notify_dashboard()
     {:noreply, state}
+  end
+
+  # Periodic re-run of the boot sweep, in a supervised task so removals (each
+  # runs the before_remove hook) never block dispatch or the dashboard. The task
+  # claims its candidates through `{:claim_for_terminal_sweep, ids}` before it
+  # removes anything; a claimed issue cannot be dispatched, so a workspace is
+  # never removed underneath a run that dispatch just started. Claims are
+  # released when the task exits. A sweep still in flight is not overlapped.
+  def handle_info(:terminal_workspace_sweep, %State{terminal_sweep_pid: pid} = state)
+      when is_pid(pid) do
+    schedule_terminal_workspace_sweep()
+    {:noreply, state}
+  end
+
+  def handle_info(:terminal_workspace_sweep, state) do
+    orchestrator = self()
+
+    state =
+      case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+             run_periodic_terminal_workspace_sweep(orchestrator)
+           end) do
+        {:ok, pid} ->
+          Process.monitor(pid)
+          %{state | terminal_sweep_pid: pid}
+
+        {:error, reason} ->
+          Logger.warning("Skipping terminal workspace sweep; failed to start task: #{inspect(reason)}")
+          state
+      end
+
+    schedule_terminal_workspace_sweep()
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, %State{terminal_sweep_pid: pid} = state)
+      when is_pid(pid) do
+    claimed = MapSet.difference(state.claimed, state.terminal_sweep_claims)
+    {:noreply, %{state | claimed: claimed, terminal_sweep_pid: nil, terminal_sweep_claims: MapSet.new()}}
   end
 
   def handle_info(
@@ -1150,6 +1195,31 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp run_periodic_terminal_workspace_sweep(orchestrator) do
+    with {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states),
+         granted = GenServer.call(orchestrator, {:claim_for_terminal_sweep, sweep_candidate_ids(issues)}),
+         {:ok, current} <- Tracker.fetch_issue_states_by_ids(granted) do
+      # Re-read states after claiming: an issue reopened between the first
+      # fetch and the claim keeps its workspace.
+      terminal_states = terminal_state_set()
+
+      current
+      |> Enum.filter(&(is_binary(&1.identifier) and terminal_issue_state?(&1.state, terminal_states)))
+      |> Enum.each(&cleanup_issue_workspace(&1.identifier))
+    else
+      {:error, reason} ->
+        Logger.warning("Skipping terminal workspace sweep; failed to fetch issues: #{inspect(reason)}")
+    end
+  end
+
+  defp sweep_candidate_ids(issues) do
+    for %Issue{id: id, identifier: identifier} <- issues, is_binary(id) and is_binary(identifier), do: id
+  end
+
+  defp schedule_terminal_workspace_sweep do
+    Process.send_after(self(), :terminal_workspace_sweep, @terminal_workspace_sweep_interval_ms)
+  end
+
   defp notify_dashboard do
     StatusDashboard.notify_update()
   end
@@ -1357,6 +1427,25 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_call({:claim_for_terminal_sweep, issue_ids}, {pid, _tag}, %State{terminal_sweep_pid: pid} = state)
+      when is_list(issue_ids) do
+    granted =
+      Enum.reject(issue_ids, fn issue_id ->
+        MapSet.member?(state.claimed, issue_id) or Map.has_key?(state.running, issue_id) or
+          Map.has_key?(state.blocked, issue_id)
+      end)
+
+    state = %{
+      state
+      | claimed: Enum.reduce(granted, state.claimed, &MapSet.put(&2, &1)),
+        terminal_sweep_claims: Enum.reduce(granted, state.terminal_sweep_claims, &MapSet.put(&2, &1))
+    }
+
+    {:reply, granted, state}
+  end
+
+  def handle_call({:claim_for_terminal_sweep, _issue_ids}, _from, state), do: {:reply, [], state}
+
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
