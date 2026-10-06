@@ -403,8 +403,30 @@ defmodule SymphonyElixir.Linear.Client do
     Req.post(Config.settings!().tracker.endpoint,
       headers: headers,
       json: payload,
-      connect_options: [timeout: 30_000]
+      connect_options: [timeout: 30_000] ++ proxy_connect_options()
     )
+  end
+
+  # Req/Mint ignore HTTPS_PROXY, so on a host whose egress goes through a local
+  # forward proxy the Linear call has to be told explicitly. Only plain-HTTP
+  # proxies (CONNECT tunnel) are supported; anything else raises on the first
+  # request rather than silently bypassing the proxy.
+  @doc false
+  @spec proxy_connect_options(%{optional(String.t()) => String.t()}) :: keyword()
+  def proxy_connect_options(env \\ System.get_env()) do
+    case env["HTTPS_PROXY"] || env["https_proxy"] do
+      proxy when proxy in [nil, ""] ->
+        []
+
+      proxy ->
+        case URI.parse(proxy) do
+          %URI{scheme: "http", host: host, port: port} when is_binary(host) and is_integer(port) ->
+            [proxy: {:http, host, port, []}]
+
+          _ ->
+            raise ArgumentError, "unsupported HTTPS_PROXY #{inspect(proxy)}; expected http://host:port"
+        end
+    end
   end
 
   defp decode_linear_response(%{"data" => %{"issues" => %{"nodes" => nodes}}}, assignee_filter) do
