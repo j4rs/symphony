@@ -104,24 +104,32 @@ defmodule SymphonyElixir.Workspace do
   end
 
   # Workspaces created before markers existed are adopted once, the first time the marker
-  # directory is set up, so upgrading doesn't rebuild (and lose) in-flight workspaces. The marker
-  # directory appears atomically (rename of a fully written temporary one), so a concurrent
-  # worker never sees a partial set, and only the winning adopter's listing takes effect.
+  # directory is set up, so upgrading doesn't rebuild (and lose) in-flight workspaces. Adoption
+  # runs under a node-wide lock (local workspaces are only created by this node), and the marker
+  # directory appears complete in one rename, so no worker ever sees a partial set.
   defp adopt_existing_workspaces(root) do
     markers = Path.join(root, @created_markers)
 
     if !File.exists?(markers) and File.dir?(root) do
-      staging = Path.join(root, ".symphony-adopting-#{System.unique_integer([:positive])}")
-      File.mkdir_p!(staging)
+      :global.trans({{__MODULE__, :adopt, root}, self()}, fn -> adopt_under_lock(root, markers) end)
+    end
+
+    :ok
+  end
+
+  defp adopt_under_lock(root, markers) do
+    if !File.exists?(markers) do
+      # Leftovers of an adoption interrupted by a crash.
+      for entry <- File.ls!(root), String.starts_with?(entry, ".symphony-adopting-"), do: File.rm_rf!(Path.join(root, entry))
+
+      staging = Path.join(root, ".symphony-adopting-" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower))
+      File.mkdir!(staging)
 
       for entry <- File.ls!(root), not String.starts_with?(entry, "."), File.dir?(Path.join(root, entry)) do
         File.write!(Path.join(staging, entry), "", [:exclusive])
       end
 
-      case File.rename(staging, markers) do
-        :ok -> :ok
-        {:error, _another_adopter_won} -> File.rm_rf(staging)
-      end
+      File.rename!(staging, markers)
     end
 
     :ok

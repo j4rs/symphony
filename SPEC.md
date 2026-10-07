@@ -793,8 +793,9 @@ Part A: Stall detection
 - For each running issue, compute `elapsed_ms` since:
   - `last_codex_timestamp` if any event has been seen, else
   - the time the workspace became ready (creation, including `after_create`, finished), else
-  - `started_at`, minus `hooks.timeout_ms`: workspace creation is bounded by the hook timeout
-    first, so a legitimately long `after_create` is not mistaken for a stall.
+  - `started_at`, minus twice `hooks.timeout_ms`: workspace creation (which may run
+    `before_remove` then `after_create` when rebuilding) is bounded by the hook timeouts first, so a
+    legitimately long `after_create` is not mistaken for a stall.
 - If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
 - Terminating a worker (stall, terminal state, or a worker that exits abnormally) also terminates
   the OS processes it started for hooks and the coding agent that are still running, so nothing it

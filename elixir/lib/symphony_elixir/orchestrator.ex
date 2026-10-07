@@ -169,12 +169,30 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  # A deferred worker kill finished: release the claims it held, unless the issue has since
+  # been re-claimed for another reason (running, retrying, blocked).
+  def handle_info({:release_claims_after_kill, issue_ids}, state) when is_list(issue_ids) do
+    releasable =
+      Enum.reject(issue_ids, fn issue_id ->
+        Map.has_key?(state.running, issue_id) or Map.has_key?(state.retry_attempts, issue_id) or
+          Map.has_key?(state.blocked, issue_id)
+      end)
+
+    {:noreply, %{state | claimed: Enum.reduce(releasable, state.claimed, &MapSet.delete(&2, &1))}}
+  end
+
   def handle_info({:DOWN, _ref, :process, pid, _reason}, %State{terminal_sweep_pid: pid} = state)
       when is_pid(pid) do
-    # A sweep that died mid-removal may have left a before_remove hook running.
-    kill_worker_processes_async(pid, fn -> :ok end)
+    # A sweep that died mid-removal may have left a before_remove hook running: its claims are
+    # released only once that is dead.
+    sweep_claims = MapSet.to_list(state.terminal_sweep_claims)
 
-    claimed = MapSet.difference(state.claimed, state.terminal_sweep_claims)
+    claimed =
+      case kill_worker_processes_async(pid, fn -> :ok end, sweep_claims) do
+        :deferred -> state.claimed
+        :done -> MapSet.difference(state.claimed, state.terminal_sweep_claims)
+      end
+
     {:noreply, %{state | claimed: claimed, terminal_sweep_pid: nil, terminal_sweep_claims: MapSet.new()}}
   end
 
@@ -188,7 +206,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         # A worker that died (crash, kill) leaves its ports' OS processes behind.
-        kill_worker_processes_async(pid, fn -> :ok end)
+        kill_worker_processes_async(pid, fn -> :ok end, [])
 
         {running_entry, state} = pop_running_entry(state, issue_id)
         state = record_session_completion_totals(state, running_entry)
@@ -608,12 +626,16 @@ defmodule SymphonyElixir.Orchestrator do
         # then clean up, so nothing it started keeps running in the workspace being removed.
         stop_running_task(pid, ref)
 
-        kill_worker_processes_async(pid, after_worker_killed(cleanup_workspace, identifier, worker_host))
+        kill_result =
+          kill_worker_processes_async(pid, after_worker_killed(cleanup_workspace, identifier, worker_host), [issue_id])
+
+        claimed =
+          if kill_result == :deferred, do: state.claimed, else: MapSet.delete(state.claimed, issue_id)
 
         %{
           state
           | running: Map.delete(state.running, issue_id),
-            claimed: MapSet.delete(state.claimed, issue_id),
+            claimed: claimed,
             blocked: Map.delete(state.blocked, issue_id),
             retry_attempts: Map.delete(state.retry_attempts, issue_id)
         }
@@ -687,10 +709,11 @@ defmodule SymphonyElixir.Orchestrator do
       {%DateTime{} = timestamp, _started_at} ->
         max(0, DateTime.diff(now, timestamp, :millisecond))
 
-      # Workspace still being created: hooks.timeout_ms is its budget; past it, creation
-      # itself counts as stalled (e.g. something hooks.timeout_ms doesn't bound hangs).
+      # Workspace still being created: two hook timeouts are its budget (rebuilding a half-built
+      # workspace runs before_remove, then after_create); past that, creation itself counts as
+      # stalled (e.g. something hooks.timeout_ms doesn't bound hangs).
       {nil, %DateTime{} = started_at} ->
-        max(0, DateTime.diff(now, started_at, :millisecond) - Config.settings!().hooks.timeout_ms)
+        max(0, DateTime.diff(now, started_at, :millisecond) - 2 * Config.settings!().hooks.timeout_ms)
 
       _ ->
         nil
@@ -789,20 +812,40 @@ defmodule SymphonyElixir.Orchestrator do
   defp after_worker_killed(false, _identifier, _worker_host), do: fn -> :ok end
 
   # A killed task closes its ports, but the hook / codex processes behind them keep running.
-  # Killing their process groups can take a few seconds (TERM grace), so it runs in a task,
-  # never blocking the orchestrator; `then` (e.g. workspace cleanup) runs once they're gone.
-  defp kill_worker_processes_async(pid, then) when is_pid(pid) and is_function(then, 0) do
-    if OsProcessGroups.owns_any?(pid) do
-      Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-        OsProcessGroups.kill_owned_by(pid)
-        then.()
-      end)
-    else
-      # Nothing left running: no need to defer (and callers see the cleanup done).
-      then.()
-    end
+  # Killing their process groups can take a few seconds (TERM grace), so when the worker still
+  # owns any, it runs in a supervised task (never blocking the orchestrator): `then` (e.g. the
+  # workspace cleanup) runs once they're gone, and `hold_claims` stay claimed until then, so
+  # neither a dispatch nor the terminal sweep can touch the issue meanwhile. Returns :deferred
+  # when the task took over, :done when everything ran inline.
+  defp kill_worker_processes_async(pid, then, hold_claims) when is_function(then, 0) do
+    if is_pid(pid) and OsProcessGroups.owns_any?(pid) do
+      orchestrator = self()
 
-    :ok
+      task = fn ->
+        try do
+          OsProcessGroups.kill_owned_by(pid)
+          then.()
+        after
+          # Hooks the cleanup itself started and left behind (e.g. it raised mid-hook).
+          OsProcessGroups.kill_owned_by(self())
+          send(orchestrator, {:release_claims_after_kill, hold_claims})
+        end
+      end
+
+      case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, task) do
+        {:ok, _task_pid} ->
+          :deferred
+
+        {:error, reason} ->
+          Logger.warning("Could not start the worker-kill task (#{inspect(reason)}); killing inline")
+          OsProcessGroups.kill_owned_by(pid)
+          then.()
+          :done
+      end
+    else
+      then.()
+      :done
+    end
   end
 
   defp stop_running_task(pid, ref) do
@@ -818,7 +861,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp stop_and_block_issue(%State{} = state, issue_id, running_entry, error) do
-    stop_running_task(Map.get(running_entry, :pid), Map.get(running_entry, :ref))
+    pid = Map.get(running_entry, :pid)
+    stop_running_task(pid, Map.get(running_entry, :ref))
+    kill_worker_processes_async(pid, fn -> :ok end, [])
     block_issue_from_entry(state, issue_id, running_entry, error)
   end
 

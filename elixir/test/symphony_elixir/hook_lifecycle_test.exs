@@ -58,6 +58,9 @@ defmodule SymphonyElixir.HookLifecycleTest do
     refute group_alive?(os_pid)
     Process.exit(owner, :kill)
 
+    # An owner with nothing registered: a no-op.
+    assert :ok = OsProcessGroups.kill_owned_by(spawn(fn -> :ok end))
+
     assert :ok = OsProcessGroups.register(2_147_483_000)
     assert :ets.match_object(OsProcessGroups, {self(), 2_147_483_000, :_}) == []
   end
@@ -167,16 +170,17 @@ defmodule SymphonyElixir.HookLifecycleTest do
     end
   end
 
-  test "the stall clock starts when the workspace is ready; creation has hooks.timeout_ms of budget" do
+  test "the stall clock starts when the workspace is ready; creation has two hook timeouts of budget" do
     write_workflow_file!(Workflow.workflow_file_path(), hook_timeout_ms: 60_000)
     now = DateTime.utc_now()
 
-    # Still creating the workspace, within the hook budget: not stalled at all.
-    assert Orchestrator.stall_elapsed_ms_for_test(%{started_at: DateTime.add(now, -30, :second)}, now) == 0
+    # Still creating the workspace, within the budget (before_remove + after_create on a
+    # rebuild): not stalled at all.
+    assert Orchestrator.stall_elapsed_ms_for_test(%{started_at: DateTime.add(now, -100, :second)}, now) == 0
 
     # Creation running far past the hook budget does count.
     long_ago = DateTime.add(now, -3_600, :second)
-    assert Orchestrator.stall_elapsed_ms_for_test(%{started_at: long_ago}, now) in 3_539_000..3_541_000
+    assert Orchestrator.stall_elapsed_ms_for_test(%{started_at: long_ago}, now) in 3_479_000..3_481_000
 
     ready = DateTime.add(now, -10, :second)
     ready_entry = %{started_at: long_ago, workspace_ready_at: ready}
@@ -296,15 +300,52 @@ defmodule SymphonyElixir.HookLifecycleTest do
     {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
     path = System.get_env("PATH")
 
+    OsProcessGroups.register(os_pid)
+
     try do
       System.put_env("PATH", "/nonexistent")
       assert :ok = OsProcessGroups.kill(os_pid)
+      assert :ok = OsProcessGroups.kill_owned_by(self())
     after
       System.put_env("PATH", path)
     end
 
+    # Never signalled, so still registered (not silently forgotten).
     assert group_alive?(os_pid)
-    assert :ok = OsProcessGroups.kill(os_pid)
+    assert OsProcessGroups.owns_any?(self())
+    assert :ok = OsProcessGroups.kill_owned_by(self())
     refute group_alive?(os_pid)
+    refute OsProcessGroups.owns_any?(self())
+  end
+
+  test "releasing claims held for a deferred kill skips issues claimed again meanwhile" do
+    state = %Orchestrator.State{
+      claimed: MapSet.new(["a", "b", "c", "d"]),
+      running: %{"b" => %{}},
+      retry_attempts: %{"c" => 1},
+      blocked: %{}
+    }
+
+    assert {:noreply, %Orchestrator.State{claimed: claimed}} =
+             Orchestrator.handle_info({:release_claims_after_kill, ["a", "b", "c"]}, state)
+
+    assert MapSet.equal?(claimed, MapSet.new(["b", "c", "d"]))
+  end
+
+  test "an adoption interrupted by a crash leaves no trace on the next attempt" do
+    root = tmp_root("stale-staging")
+
+    try do
+      File.mkdir_p!(Path.join(root, ".symphony-adopting-deadbeef"))
+      File.write!(Path.join([root, ".symphony-adopting-deadbeef", "MT-999"]), "")
+      File.mkdir_p!(Path.join(root, "MT-908"))
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, hook_after_create: "true")
+
+      assert {:ok, _} = Workspace.create_for_issue("MT-908")
+      refute File.exists?(Path.join(root, ".symphony-adopting-deadbeef"))
+      assert File.ls!(Path.join(root, ".symphony-created")) == ["MT-908"]
+    after
+      File.rm_rf(root)
+    end
   end
 end

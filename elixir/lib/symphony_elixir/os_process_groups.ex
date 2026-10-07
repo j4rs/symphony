@@ -18,6 +18,8 @@ defmodule SymphonyElixir.OsProcessGroups do
 
   use GenServer
 
+  require Logger
+
   @table __MODULE__
   @exit_grace_ms 2_000
   @term_grace_ms 2_000
@@ -72,9 +74,9 @@ defmodule SymphonyElixir.OsProcessGroups do
   @spec kill_owned_by(pid()) :: :ok
   def kill_owned_by(owner) when is_pid(owner) do
     groups = for {^owner, os_pid, started} <- :ets.lookup(@table, owner), do: {os_pid, started}
-    signal_groups(groups, 0)
+
     # Forget them only once they're dead: a caller killed mid-wait leaves them registered.
-    :ets.delete(@table, owner)
+    if signal_groups(groups, 0) == :ok, do: :ets.delete(@table, owner)
     :ok
   end
 
@@ -98,53 +100,58 @@ defmodule SymphonyElixir.OsProcessGroups do
         entries -> for {_owner, ^os_pid, started} <- entries, do: {os_pid, started}
       end
 
-    signal_groups(groups, exit_grace_ms)
-    unregister(os_pid)
+    if signal_groups(groups, exit_grace_ms) == :ok, do: unregister(os_pid)
+    :ok
   end
 
-  defp signal_groups(groups, exit_grace_ms) do
-    groups
-    |> Enum.filter(&ours?/1)
-    |> Enum.map(fn {os_pid, _started} -> os_pid end)
-    |> wait_until_gone(exit_grace_ms)
-    |> tap(fn live -> Enum.each(live, &signal("TERM", &1)) end)
-    |> wait_until_gone(@term_grace_ms)
-    |> tap(fn live -> Enum.each(live, &signal("KILL", &1)) end)
-    |> wait_until_gone(@kill_wait_ms)
+  # :ok once every group is dead (or was never ours); {:error, :no_kill} if they can't be
+  # signalled, in which case callers keep them registered.
+  defp signal_groups([], _exit_grace_ms), do: :ok
 
-    :ok
+  defp signal_groups(groups, exit_grace_ms) do
+    case System.find_executable("kill") do
+      nil ->
+        Logger.warning("Cannot signal process groups: no `kill` executable on PATH; leaving #{length(groups)} registered")
+        {:error, :no_kill}
+
+      kill ->
+        groups
+        |> Enum.filter(&ours?(kill, &1))
+        |> Enum.map(fn {os_pid, _started} -> os_pid end)
+        |> wait_until_gone(kill, exit_grace_ms)
+        |> tap(fn live -> Enum.each(live, &signal(kill, "TERM", &1)) end)
+        |> wait_until_gone(kill, @term_grace_ms)
+        |> tap(fn live -> Enum.each(live, &signal(kill, "KILL", &1)) end)
+        |> wait_until_gone(kill, @kill_wait_ms)
+
+        :ok
+    end
   end
 
   # Still the group we registered: its leader is the same process (same start time), or the
   # leader is gone and the group lives on (a live group's id is never reused as a pid).
-  defp ours?({os_pid, started}) do
+  defp ours?(kill, {os_pid, started}) do
     case start_time(os_pid) do
-      nil -> signal("0", os_pid)
+      nil -> signal(kill, "0", os_pid)
       ^started -> true
       _reused -> false
     end
   end
 
-  defp wait_until_gone(pgids, remaining_ms) do
-    live = Enum.filter(pgids, &signal("0", &1))
+  defp wait_until_gone(pgids, kill, remaining_ms) do
+    live = Enum.filter(pgids, &signal(kill, "0", &1))
 
     if live == [] or remaining_ms <= 0 do
       live
     else
       Process.sleep(@poll_ms)
-      wait_until_gone(live, remaining_ms - @poll_ms)
+      wait_until_gone(live, kill, remaining_ms - @poll_ms)
     end
   end
 
-  defp signal(signal, pgid) do
-    case System.find_executable("kill") do
-      nil ->
-        false
-
-      kill ->
-        {_output, status} = System.cmd(kill, ["-s", signal, "--", "-#{pgid}"], stderr_to_stdout: true)
-        status == 0
-    end
+  defp signal(kill, signal, pgid) do
+    {_output, status} = System.cmd(kill, ["-s", signal, "--", "-#{pgid}"], stderr_to_stdout: true)
+    status == 0
   end
 
   # Process start time (clock ticks since boot, /proc/<pid>/stat field 22), nil if gone.

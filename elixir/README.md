@@ -132,7 +132,7 @@ Notes:
   `git clone ... .` there, along with any other setup commands you need. A workspace counts as
   created only once `after_create` completes (recorded in `<workspace.root>/.symphony-created/`); a
   directory left by a failed or interrupted `after_create` is rebuilt on the next dispatch. A long
-  `after_create` is bounded by `hooks.timeout_ms`, not by `codex.stall_timeout_ms`.
+  `after_create` is bounded by `hooks.timeout_ms` (twice, when rebuilding), not by `codex.stall_timeout_ms`.
 - When a hook times out or Symphony abandons a run (stall, terminal state, crashed worker), the
   still-running hook and agent processes are killed as process groups, including their background
   children (local workers on Linux). Not covered: SSH workers, processes that start their own
