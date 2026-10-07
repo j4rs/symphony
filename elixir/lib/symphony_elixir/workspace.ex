@@ -105,8 +105,9 @@ defmodule SymphonyElixir.Workspace do
 
   # Workspaces created before markers existed are adopted once, the first time the marker
   # directory is set up, so upgrading doesn't rebuild (and lose) in-flight workspaces. Adoption
-  # runs under a node-wide lock (local workspaces are only created by this node), and the marker
-  # directory appears complete in one rename, so no worker ever sees a partial set.
+  # runs under a :global lock (this node, or its cluster if distributed), and the marker
+  # directory appears complete in one rename, so no worker ever sees a partial set. Another
+  # Symphony instance sharing the root is tolerated: whoever renames first wins.
   defp adopt_existing_workspaces(root) do
     markers = Path.join(root, @created_markers)
 
@@ -119,8 +120,11 @@ defmodule SymphonyElixir.Workspace do
 
   defp adopt_under_lock(root, markers) do
     if !File.exists?(markers) do
-      # Leftovers of an adoption interrupted by a crash.
-      for entry <- File.ls!(root), String.starts_with?(entry, ".symphony-adopting-"), do: File.rm_rf!(Path.join(root, entry))
+      # Leftovers of an adoption interrupted by a crash (old enough not to be another
+      # instance's adoption in progress).
+      for entry <- File.ls!(root), String.starts_with?(entry, ".symphony-adopting-"), stale_staging?(root, entry) do
+        File.rm_rf!(Path.join(root, entry))
+      end
 
       staging = Path.join(root, ".symphony-adopting-" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower))
       File.mkdir!(staging)
@@ -129,10 +133,30 @@ defmodule SymphonyElixir.Workspace do
         File.write!(Path.join(staging, entry), "", [:exclusive])
       end
 
-      File.rename!(staging, markers)
+      publish_markers(staging, markers)
     end
 
     :ok
+  end
+
+  defp publish_markers(staging, markers) do
+    case File.rename(staging, markers) do
+      :ok ->
+        :ok
+
+      # Another instance adopted first: fine. Anything else is a real error.
+      {:error, _reason} when is_binary(markers) ->
+        File.rm_rf(staging)
+        File.dir?(markers) || raise File.Error, reason: :eexist, action: "rename markers into place", path: markers
+        :ok
+    end
+  end
+
+  defp stale_staging?(root, entry) do
+    case File.stat(Path.join(root, entry), time: :posix) do
+      {:ok, %File.Stat{mtime: mtime}} -> System.os_time(:second) - mtime > 3_600
+      _ -> false
+    end
   end
 
   defp write_created_marker(workspace) do

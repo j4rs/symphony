@@ -66,17 +66,14 @@ defmodule SymphonyElixir.OsProcessGroups do
     :ok
   end
 
-  @doc "Whether `owner` (a worker pid) has any process groups registered."
-  @spec owns_any?(pid()) :: boolean()
-  def owns_any?(owner) when is_pid(owner), do: :ets.member(@table, owner)
-
   @doc "Kills every group registered by `owner` (a worker pid) at once, and forgets them."
   @spec kill_owned_by(pid()) :: :ok
   def kill_owned_by(owner) when is_pid(owner) do
     groups = for {^owner, os_pid, started} <- :ets.lookup(@table, owner), do: {os_pid, started}
 
-    # Forget them only once they're dead: a caller killed mid-wait leaves them registered.
-    if signal_groups(groups, 0) == :ok, do: :ets.delete(@table, owner)
+    # Forget them once they're dead (a caller killed mid-wait leaves them registered), or when
+    # they can't be signalled at all (logged; nothing would ever retry).
+    if signal_groups(groups, 0) != {:error, :survived}, do: :ets.delete(@table, owner)
     :ok
   end
 
@@ -100,18 +97,19 @@ defmodule SymphonyElixir.OsProcessGroups do
         entries -> for {_owner, ^os_pid, started} <- entries, do: {os_pid, started}
       end
 
-    if signal_groups(groups, exit_grace_ms) == :ok, do: unregister(os_pid)
+    if signal_groups(groups, exit_grace_ms) != {:error, :survived}, do: unregister(os_pid)
     :ok
   end
 
-  # :ok once every group is dead (or was never ours); {:error, :no_kill} if they can't be
-  # signalled, in which case callers keep them registered.
+  # :ok once every group is dead (or was never ours); {:error, :survived} if some outlived
+  # KILL (e.g. stuck in uninterruptible I/O; callers keep them registered); {:error, :no_kill}
+  # if nothing can be signalled.
   defp signal_groups([], _exit_grace_ms), do: :ok
 
   defp signal_groups(groups, exit_grace_ms) do
     case System.find_executable("kill") do
       nil ->
-        Logger.warning("Cannot signal process groups: no `kill` executable on PATH; leaving #{length(groups)} registered")
+        Logger.error("Cannot signal process groups: no `kill` executable on PATH; #{length(groups)} may still be running")
         {:error, :no_kill}
 
       kill ->
@@ -123,8 +121,14 @@ defmodule SymphonyElixir.OsProcessGroups do
         |> wait_until_gone(kill, @term_grace_ms)
         |> tap(fn live -> Enum.each(live, &signal(kill, "KILL", &1)) end)
         |> wait_until_gone(kill, @kill_wait_ms)
+        |> case do
+          [] ->
+            :ok
 
-        :ok
+          survivors ->
+            Logger.error("Process groups survived KILL (still registered): #{inspect(survivors)}")
+            {:error, :survived}
+        end
     end
   end
 

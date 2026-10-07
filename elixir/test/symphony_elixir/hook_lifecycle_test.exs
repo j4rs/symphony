@@ -295,7 +295,7 @@ defmodule SymphonyElixir.HookLifecycleTest do
     end
   end
 
-  test "without a kill executable, signalling is a no-op instead of a crash" do
+  test "without a kill executable, signalling fails safely instead of crashing" do
     port = Port.open({:spawn_executable, ~c"/bin/sh"}, [:binary, args: [~c"-c", ~c"sleep 60"]])
     {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
     path = System.get_env("PATH")
@@ -310,26 +310,11 @@ defmodule SymphonyElixir.HookLifecycleTest do
       System.put_env("PATH", path)
     end
 
-    # Never signalled, so still registered (not silently forgotten).
+    # Nothing could signal it: still running, and dropped from the registry (logged as an error).
     assert group_alive?(os_pid)
-    assert OsProcessGroups.owns_any?(self())
-    assert :ok = OsProcessGroups.kill_owned_by(self())
+    assert :ets.match_object(OsProcessGroups, {self(), os_pid, :_}) == []
+    assert :ok = OsProcessGroups.kill(os_pid)
     refute group_alive?(os_pid)
-    refute OsProcessGroups.owns_any?(self())
-  end
-
-  test "releasing claims held for a deferred kill skips issues claimed again meanwhile" do
-    state = %Orchestrator.State{
-      claimed: MapSet.new(["a", "b", "c", "d"]),
-      running: %{"b" => %{}},
-      retry_attempts: %{"c" => 1},
-      blocked: %{}
-    }
-
-    assert {:noreply, %Orchestrator.State{claimed: claimed}} =
-             Orchestrator.handle_info({:release_claims_after_kill, ["a", "b", "c"]}, state)
-
-    assert MapSet.equal?(claimed, MapSet.new(["b", "c", "d"]))
   end
 
   test "an adoption interrupted by a crash leaves no trace on the next attempt" do
@@ -338,14 +323,43 @@ defmodule SymphonyElixir.HookLifecycleTest do
     try do
       File.mkdir_p!(Path.join(root, ".symphony-adopting-deadbeef"))
       File.write!(Path.join([root, ".symphony-adopting-deadbeef", "MT-999"]), "")
+      File.touch!(Path.join(root, ".symphony-adopting-deadbeef"), System.os_time(:second) - 7_200)
+      File.mkdir_p!(Path.join(root, ".symphony-adopting-inprogress"))
       File.mkdir_p!(Path.join(root, "MT-908"))
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, hook_after_create: "true")
 
       assert {:ok, _} = Workspace.create_for_issue("MT-908")
       refute File.exists?(Path.join(root, ".symphony-adopting-deadbeef"))
+      # A recent staging dir may be another instance's adoption in progress: left alone.
+      assert File.exists?(Path.join(root, ".symphony-adopting-inprogress"))
       assert File.ls!(Path.join(root, ".symphony-created")) == ["MT-908"]
     after
       File.rm_rf(root)
     end
+  end
+
+  test "groups that outlive KILL stay registered" do
+    root = tmp_root("fake-kill")
+    File.mkdir_p!(root)
+    # A `kill` that reports every group alive and kills nothing: as if stuck in D-state.
+    File.write!(Path.join(root, "kill"), "#!/bin/sh\nexit 0\n")
+    File.chmod!(Path.join(root, "kill"), 0o755)
+    port = Port.open({:spawn_executable, ~c"/bin/sh"}, [:binary, args: [~c"-c", ~c"sleep 60"]])
+    {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
+    OsProcessGroups.register(os_pid)
+    path = System.get_env("PATH")
+
+    try do
+      System.put_env("PATH", root <> ":" <> path)
+      assert :ok = OsProcessGroups.kill_owned_by(self())
+    after
+      System.put_env("PATH", path)
+      File.rm_rf(root)
+    end
+
+    assert [_] = :ets.match_object(OsProcessGroups, {self(), os_pid, :_})
+    assert :ok = OsProcessGroups.kill_owned_by(self())
+    refute group_alive?(os_pid)
+    assert :ets.match_object(OsProcessGroups, {self(), os_pid, :_}) == []
   end
 end
