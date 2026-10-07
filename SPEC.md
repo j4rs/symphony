@@ -792,8 +792,16 @@ Part A: Stall detection
 
 - For each running issue, compute `elapsed_ms` since:
   - `last_codex_timestamp` if any event has been seen, else
-  - `started_at`
+  - the time the workspace became ready (creation, including `after_create`, finished), else
+  - `started_at`, minus twice `hooks.timeout_ms`: workspace creation (which may run
+    `before_remove` then `after_create` when rebuilding) is bounded by the hook timeouts first, so a
+    legitimately long `after_create` is not mistaken for a stall.
 - If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
+- Terminating a worker (stall, terminal state, or a worker that exits abnormally) also terminates
+  the OS processes it started for hooks and the coding agent that are still running, so nothing it
+  left running races the retry in the same workspace (Elixir implementation, local workers on Linux:
+  their process groups; not SSH workers, not processes that start their own session, and not
+  background children of a hook that had already exited).
 - If `stall_timeout_ms <= 0`, skip stall detection entirely.
 
 Part B: Tracker state refresh
@@ -841,9 +849,16 @@ Algorithm summary:
 1. Sanitize identifier to `workspace_key`.
 2. Compute workspace path under workspace root.
 3. Ensure the workspace path exists as a directory.
-4. Mark `created_now=true` only if the directory was created during this call; otherwise
+4. Mark `created_now=true` if the directory was created during this call; otherwise
    `created_now=false`.
 5. If `created_now=true`, run `after_create` hook if configured.
+
+Elixir implementation (local workspaces): a workspace is recorded as created (a marker under the
+workspace root, outside any workspace) only once `after_create` has completed. An existing directory
+without that record never finished `after_create` (it failed, timed out, or the service stopped
+mid-hook), so it is removed and rebuilt with `created_now=true`; a failed `after_create` removes its
+directory. Workspaces that predate the record are adopted (recorded as created) once, the first time
+the record directory is set up. This is the explicitly chosen reset policy referred to in 9.3.
 
 Notes:
 
@@ -881,7 +896,10 @@ Execution contract:
   `cwd`.
 - On POSIX systems, `sh -lc <script>` (or a stricter equivalent such as `bash -lc <script>`) is a
   conforming default.
-- Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
+- Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`. On timeout, the hook's processes are
+  terminated, including anything it started in the background (Elixir implementation, local hooks
+  on Linux: the hook's process group; processes that start their own session, and SSH-worker hooks,
+  are not covered).
 - Log hook start, failures, and timeouts.
 
 Failure semantics:

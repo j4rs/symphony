@@ -4,14 +4,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, OsProcessGroups, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
   @port_line_bytes 1_048_576
-  @port_term_grace_ms 2_000
-  @port_term_poll_ms 100
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
 
@@ -206,6 +204,11 @@ defmodule SymphonyElixir.Codex.AppServer do
             line: @port_line_bytes
           ]
         )
+
+      case :erlang.port_info(port, :os_pid) do
+        {:os_pid, os_pid} -> OsProcessGroups.register(os_pid)
+        _ -> :ok
+      end
 
       {:ok, port}
     end
@@ -1032,37 +1035,10 @@ defmodule SymphonyElixir.Codex.AppServer do
   # Port.close/1 only closes the pipes. A codex still starting up (e.g. slow to
   # open ~/.codex sqlite) never reads stdin, never sees EOF, and keeps its
   # state-DB locks, so every retry then dies with "failed to initialize sqlite
-  # state runtime". erl_child_setup starts each port in its own session, so the
-  # port's OS pid is a process-group leader: TERM the group (codex, its node
-  # wrapper and anything they spawned), then KILL whatever is left.
+  # state runtime". Stop the port's whole process group (see OsProcessGroups): a
+  # short grace to exit on EOF, then TERM, then KILL.
   defp terminate_os_process_group(os_pid) when is_integer(os_pid) do
-    target = if signal_os_process("0", "-#{os_pid}"), do: "-#{os_pid}", else: "#{os_pid}"
-
-    if signal_os_process("TERM", target) and !wait_for_os_exit(target, @port_term_grace_ms) do
-      signal_os_process("KILL", target)
-    end
-
-    :ok
-  end
-
-  defp wait_for_os_exit(target, remaining_ms) when remaining_ms <= 0, do: !signal_os_process("0", target)
-
-  defp wait_for_os_exit(target, remaining_ms) do
-    if signal_os_process("0", target) do
-      Process.sleep(@port_term_poll_ms)
-      wait_for_os_exit(target, remaining_ms - @port_term_poll_ms)
-    else
-      true
-    end
-  end
-
-  defp signal_os_process(signal, target) do
-    case System.cmd("kill", ["-s", signal, "--", target], stderr_to_stdout: true) do
-      {_output, 0} -> true
-      {_output, _status} -> false
-    end
-  rescue
-    ErlangError -> false
+    OsProcessGroups.stop(os_pid)
   end
 
   defp emit_message(on_message, event, details, metadata) when is_function(on_message, 1) do

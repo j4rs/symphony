@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, OsProcessGroups, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -171,12 +171,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:DOWN, _ref, :process, pid, _reason}, %State{terminal_sweep_pid: pid} = state)
       when is_pid(pid) do
+    # A sweep that died mid-removal may have left a before_remove hook running: kill it before
+    # its claims are released.
+    OsProcessGroups.kill_owned_by(pid)
     claimed = MapSet.difference(state.claimed, state.terminal_sweep_claims)
+
     {:noreply, %{state | claimed: claimed, terminal_sweep_pid: nil, terminal_sweep_claims: MapSet.new()}}
   end
 
   def handle_info(
-        {:DOWN, ref, :process, _pid, reason},
+        {:DOWN, ref, :process, pid, reason},
         %{running: running} = state
       ) do
     case find_issue_id_for_ref(running, ref) do
@@ -184,6 +188,9 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       issue_id ->
+        # A worker that died (crash, kill) leaves its ports' OS processes behind.
+        OsProcessGroups.kill_owned_by(pid)
+
         {running_entry, state} = pop_running_entry(state, issue_id)
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
@@ -208,6 +215,7 @@ defmodule SymphonyElixir.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> Map.put_new(:workspace_ready_at, DateTime.utc_now())
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -429,6 +437,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec stall_elapsed_ms_for_test(map(), DateTime.t()) :: non_neg_integer() | nil
+  def stall_elapsed_ms_for_test(running_entry, now), do: stall_elapsed_ms(running_entry, now)
+
+  @doc false
   @spec sort_issues_for_dispatch_for_test([Issue.t()]) :: [Issue.t()]
   def sort_issues_for_dispatch_for_test(issues) when is_list(issues) do
     sort_issues_for_dispatch(issues)
@@ -593,11 +605,13 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         worker_host = Map.get(running_entry, :worker_host)
 
+        # Stop the worker and its OS processes before the cleanup, so nothing it started keeps
+        # running in (or recreating) the workspace being removed.
+        stop_running_task(pid, ref)
+
         if cleanup_workspace do
           cleanup_issue_workspace(identifier, worker_host)
         end
-
-        stop_running_task(pid, ref)
 
         %{
           state
@@ -672,19 +686,27 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp stall_elapsed_ms(running_entry, now) do
-    running_entry
-    |> last_activity_timestamp()
-    |> case do
-      %DateTime{} = timestamp ->
+    case {last_activity_timestamp(running_entry), Map.get(running_entry, :started_at)} do
+      {%DateTime{} = timestamp, _started_at} ->
         max(0, DateTime.diff(now, timestamp, :millisecond))
+
+      # Workspace still being created: two hook timeouts are its budget (rebuilding a half-built
+      # workspace runs before_remove, then after_create); past that, creation itself counts as
+      # stalled (e.g. something hooks.timeout_ms doesn't bound hangs).
+      {nil, %DateTime{} = started_at} ->
+        max(0, DateTime.diff(now, started_at, :millisecond) - 2 * Config.settings!().hooks.timeout_ms)
 
       _ ->
         nil
     end
   end
 
+  # The stall clock starts when the workspace is ready (worker_runtime_info), not at
+  # dispatch: workspace creation runs after_create, which can legitimately take minutes. Until
+  # then, stall_elapsed_ms only counts time beyond hooks.timeout_ms. Killing a run
+  # mid-after_create orphaned its prep.
   defp last_activity_timestamp(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
+    Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :workspace_ready_at)
   end
 
   defp last_activity_timestamp(_running_entry), do: nil
@@ -765,9 +787,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp terminate_task(_pid), do: :ok
 
+  # A killed task closes its ports, but the hook / codex processes behind them keep running:
+  # kill the process groups it registered. Bounded: every group gets TERM at once, at most ~3s
+  # in all for whatever ignores it (processes normally exit on TERM within milliseconds).
   defp stop_running_task(pid, ref) do
     if is_pid(pid) do
       terminate_task(pid)
+      OsProcessGroups.kill_owned_by(pid)
     end
 
     if is_reference(ref) do
