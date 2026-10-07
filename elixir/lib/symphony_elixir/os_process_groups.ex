@@ -64,12 +64,18 @@ defmodule SymphonyElixir.OsProcessGroups do
     :ok
   end
 
+  @doc "Whether `owner` (a worker pid) has any process groups registered."
+  @spec owns_any?(pid()) :: boolean()
+  def owns_any?(owner) when is_pid(owner), do: :ets.member(@table, owner)
+
   @doc "Kills every group registered by `owner` (a worker pid) at once, and forgets them."
   @spec kill_owned_by(pid()) :: :ok
   def kill_owned_by(owner) when is_pid(owner) do
     groups = for {^owner, os_pid, started} <- :ets.lookup(@table, owner), do: {os_pid, started}
-    :ets.delete(@table, owner)
     signal_groups(groups, 0)
+    # Forget them only once they're dead: a caller killed mid-wait leaves them registered.
+    :ets.delete(@table, owner)
+    :ok
   end
 
   @doc """
@@ -92,8 +98,8 @@ defmodule SymphonyElixir.OsProcessGroups do
         entries -> for {_owner, ^os_pid, started} <- entries, do: {os_pid, started}
       end
 
-    unregister(os_pid)
     signal_groups(groups, exit_grace_ms)
+    unregister(os_pid)
   end
 
   defp signal_groups(groups, exit_grace_ms) do
@@ -131,15 +137,22 @@ defmodule SymphonyElixir.OsProcessGroups do
   end
 
   defp signal(signal, pgid) do
-    {_output, status} = System.cmd("kill", ["-s", signal, "--", "-#{pgid}"], stderr_to_stdout: true)
-    status == 0
+    case System.find_executable("kill") do
+      nil ->
+        false
+
+      kill ->
+        {_output, status} = System.cmd(kill, ["-s", signal, "--", "-#{pgid}"], stderr_to_stdout: true)
+        status == 0
+    end
   end
 
   # Process start time (clock ticks since boot, /proc/<pid>/stat field 22), nil if gone.
   defp start_time(os_pid) do
+    # comm (field 2) is in parentheses and may itself contain ") ": split after the last ")".
     with {:ok, stat} <- File.read("/proc/#{os_pid}/stat"),
-         [_, rest] <- String.split(stat, ") ", parts: 2),
-         fields when length(fields) > 19 <- String.split(rest) do
+         {pos, 1} <- :binary.matches(stat, ")") |> List.last(),
+         fields when length(fields) > 19 <- stat |> binary_part(pos + 1, byte_size(stat) - pos - 1) |> String.split() do
       Enum.at(fields, 19)
     else
       _ -> nil

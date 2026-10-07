@@ -42,6 +42,7 @@ defmodule SymphonyElixir.Workspace do
         # No marker: after_create never finished here (it failed, timed out, or Symphony
         # was stopped mid-prep). Reusing it would skip after_create for good.
         Logger.warning("Rebuilding incomplete workspace (after_create never completed) workspace=#{workspace}")
+        maybe_run_before_remove_hook(workspace, nil)
         create_workspace(workspace)
 
       File.exists?(workspace) ->
@@ -87,6 +88,8 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp create_workspace(workspace) do
+    # A marker left from an earlier copy must not vouch for this one before after_create runs.
+    File.rm_rf!(created_marker(workspace))
     File.rm_rf!(workspace)
     File.mkdir_p!(workspace)
     {:ok, workspace, true}
@@ -101,15 +104,23 @@ defmodule SymphonyElixir.Workspace do
   end
 
   # Workspaces created before markers existed are adopted once, the first time the marker
-  # directory is set up, so upgrading doesn't rebuild (and lose) in-flight workspaces.
+  # directory is set up, so upgrading doesn't rebuild (and lose) in-flight workspaces. The marker
+  # directory appears atomically (rename of a fully written temporary one), so a concurrent
+  # worker never sees a partial set, and only the winning adopter's listing takes effect.
   defp adopt_existing_workspaces(root) do
     markers = Path.join(root, @created_markers)
 
     if !File.exists?(markers) and File.dir?(root) do
-      File.mkdir_p!(markers)
+      staging = Path.join(root, ".symphony-adopting-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(staging)
 
       for entry <- File.ls!(root), not String.starts_with?(entry, "."), File.dir?(Path.join(root, entry)) do
-        write_created_marker(Path.join(root, entry))
+        File.write!(Path.join(staging, entry), "", [:exclusive])
+      end
+
+      case File.rename(staging, markers) do
+        :ok -> :ok
+        {:error, _another_adopter_won} -> File.rm_rf(staging)
       end
     end
 
@@ -131,8 +142,12 @@ defmodule SymphonyElixir.Workspace do
     File.write!(marker, "", [:exclusive])
   end
 
-  defp run_after_create_or_discard(workspace, issue_context, created?, nil) do
-    case maybe_run_after_create_hook(workspace, issue_context, created?, nil) do
+  defp run_after_create_or_discard(workspace, issue_context, false, nil) do
+    maybe_run_after_create_hook(workspace, issue_context, false, nil)
+  end
+
+  defp run_after_create_or_discard(workspace, issue_context, true, nil) do
+    case maybe_run_after_create_hook(workspace, issue_context, true, nil) do
       :ok ->
         try do
           write_created_marker(workspace)
@@ -140,20 +155,26 @@ defmodule SymphonyElixir.Workspace do
         rescue
           error in [File.Error] ->
             Logger.error("Could not record workspace as created; discarding it workspace=#{workspace} error=#{Exception.message(error)}")
-            File.rm_rf(workspace)
+            discard_workspace(workspace)
             {:error, error}
         end
 
       {:error, _reason} = error ->
         # Never leave a half-built workspace to be reused without after_create.
-        File.rm_rf(workspace)
-        File.rm_rf(created_marker(workspace))
+        discard_workspace(workspace)
         error
     end
   end
 
   defp run_after_create_or_discard(workspace, issue_context, created?, worker_host) do
     maybe_run_after_create_hook(workspace, issue_context, created?, worker_host)
+  end
+
+  # before_remove releases what a partial after_create already set up (e.g. databases).
+  defp discard_workspace(workspace) do
+    maybe_run_before_remove_hook(workspace, nil)
+    File.rm_rf(created_marker(workspace))
+    File.rm_rf(workspace)
   end
 
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
@@ -174,6 +195,7 @@ defmodule SymphonyElixir.Workspace do
         end
 
       false ->
+        File.rm_rf(created_marker(workspace))
         File.rm_rf(workspace)
     end
   end

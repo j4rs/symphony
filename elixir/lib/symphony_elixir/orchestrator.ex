@@ -171,6 +171,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:DOWN, _ref, :process, pid, _reason}, %State{terminal_sweep_pid: pid} = state)
       when is_pid(pid) do
+    # A sweep that died mid-removal may have left a before_remove hook running.
+    kill_worker_processes_async(pid, fn -> :ok end)
+
     claimed = MapSet.difference(state.claimed, state.terminal_sweep_claims)
     {:noreply, %{state | claimed: claimed, terminal_sweep_pid: nil, terminal_sweep_claims: MapSet.new()}}
   end
@@ -185,7 +188,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         # A worker that died (crash, kill) leaves its ports' OS processes behind.
-        OsProcessGroups.kill_owned_by(pid)
+        kill_worker_processes_async(pid, fn -> :ok end)
 
         {running_entry, state} = pop_running_entry(state, issue_id)
         state = record_session_completion_totals(state, running_entry)
@@ -601,13 +604,11 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         worker_host = Map.get(running_entry, :worker_host)
 
-        # Stop the worker and its OS processes first, so nothing it started keeps
-        # running in (or recreating) the workspace the cleanup is about to remove.
+        # Stop the worker, then (off the orchestrator process) kill its OS processes and only
+        # then clean up, so nothing it started keeps running in the workspace being removed.
         stop_running_task(pid, ref)
 
-        if cleanup_workspace do
-          cleanup_issue_workspace(identifier, worker_host)
-        end
+        kill_worker_processes_async(pid, after_worker_killed(cleanup_workspace, identifier, worker_host))
 
         %{
           state
@@ -782,12 +783,31 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp terminate_task(_pid), do: :ok
 
+  defp after_worker_killed(true, identifier, worker_host),
+    do: fn -> cleanup_issue_workspace(identifier, worker_host) end
+
+  defp after_worker_killed(false, _identifier, _worker_host), do: fn -> :ok end
+
+  # A killed task closes its ports, but the hook / codex processes behind them keep running.
+  # Killing their process groups can take a few seconds (TERM grace), so it runs in a task,
+  # never blocking the orchestrator; `then` (e.g. workspace cleanup) runs once they're gone.
+  defp kill_worker_processes_async(pid, then) when is_pid(pid) and is_function(then, 0) do
+    if OsProcessGroups.owns_any?(pid) do
+      Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+        OsProcessGroups.kill_owned_by(pid)
+        then.()
+      end)
+    else
+      # Nothing left running: no need to defer (and callers see the cleanup done).
+      then.()
+    end
+
+    :ok
+  end
+
   defp stop_running_task(pid, ref) do
     if is_pid(pid) do
       terminate_task(pid)
-      # A killed task closes its ports, but the hook / codex processes behind them
-      # would keep running; kill the process groups it registered.
-      OsProcessGroups.kill_owned_by(pid)
     end
 
     if is_reference(ref) do

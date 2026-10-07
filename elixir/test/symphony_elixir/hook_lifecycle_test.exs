@@ -230,4 +230,81 @@ defmodule SymphonyElixir.HookLifecycleTest do
       File.rm_rf(elsewhere)
     end
   end
+
+  test "a stale marker never vouches for a workspace whose directory is gone" do
+    root = tmp_root("stale-marker")
+    counter = Path.join(root, "after-create-runs")
+
+    try do
+      File.mkdir_p!(Path.join(root, ".symphony-created"))
+      File.write!(Path.join([root, ".symphony-created", "MT-905"]), "")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, hook_after_create: "echo run >> #{counter}")
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-905")
+      assert File.read!(counter) == "run\n"
+
+      # Reuse leaves the marker alone (no rewrite on every dispatch).
+      marker = Path.join([root, ".symphony-created", "MT-905"])
+      File.touch!(marker, {{2001, 1, 1}, {0, 0, 0}})
+      assert {:ok, ^workspace} = Workspace.create_for_issue("MT-905")
+      assert File.stat!(marker).mtime == {{2001, 1, 1}, {0, 0, 0}}
+
+      # Removing a directory that is already gone still forgets its marker.
+      File.rm_rf!(workspace)
+      Workspace.remove(workspace)
+      refute File.exists?(marker)
+    after
+      File.rm_rf(root)
+    end
+  end
+
+  test "rebuilding or discarding a half-built workspace runs before_remove first" do
+    root = tmp_root("before-remove-on-discard")
+    removed = Path.join(root, "before-remove-ran")
+
+    try do
+      File.mkdir_p!(Path.join(root, ".symphony-created"))
+      File.mkdir_p!(Path.join(root, "MT-906"))
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: root,
+        hook_after_create: "true",
+        hook_before_remove: "echo $(basename $PWD) >> #{removed}"
+      )
+
+      # Half-built (no marker): before_remove releases it, then it is rebuilt.
+      assert {:ok, _workspace} = Workspace.create_for_issue("MT-906")
+      assert File.read!(removed) == "MT-906\n"
+
+      # A failed after_create: before_remove runs, then the directory is discarded.
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: root,
+        hook_after_create: "exit 4",
+        hook_before_remove: "echo $(basename $PWD) >> #{removed}"
+      )
+
+      assert {:error, _} = Workspace.create_for_issue("MT-907")
+      assert File.read!(removed) == "MT-906\nMT-907\n"
+      refute File.exists?(Path.join(root, "MT-907"))
+    after
+      File.rm_rf(root)
+    end
+  end
+
+  test "without a kill executable, signalling is a no-op instead of a crash" do
+    port = Port.open({:spawn_executable, ~c"/bin/sh"}, [:binary, args: [~c"-c", ~c"sleep 60"]])
+    {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
+    path = System.get_env("PATH")
+
+    try do
+      System.put_env("PATH", "/nonexistent")
+      assert :ok = OsProcessGroups.kill(os_pid)
+    after
+      System.put_env("PATH", path)
+    end
+
+    assert group_alive?(os_pid)
+    assert :ok = OsProcessGroups.kill(os_pid)
+    refute group_alive?(os_pid)
+  end
 end

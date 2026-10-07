@@ -797,8 +797,10 @@ Part A: Stall detection
     first, so a legitimately long `after_create` is not mistaken for a stall.
 - If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
 - Terminating a worker (stall, terminal state, or a worker that exits abnormally) also terminates
-  the OS processes it started for hooks and the coding agent (Elixir implementation: their process
-  groups), so nothing it left running races the retry in the same workspace.
+  the OS processes it started for hooks and the coding agent that are still running, so nothing it
+  left running races the retry in the same workspace (Elixir implementation, local workers on Linux:
+  their process groups; not SSH workers, not processes that start their own session, and not
+  background children of a hook that had already exited).
 - If `stall_timeout_ms <= 0`, skip stall detection entirely.
 
 Part B: Tracker state refresh
@@ -894,8 +896,9 @@ Execution contract:
 - On POSIX systems, `sh -lc <script>` (or a stricter equivalent such as `bash -lc <script>`) is a
   conforming default.
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`. On timeout, the hook's processes are
-  terminated, including anything it started in the background (Elixir implementation: the hook's
-  process group).
+  terminated, including anything it started in the background (Elixir implementation, local hooks
+  on Linux: the hook's process group; processes that start their own session, and SSH-worker hooks,
+  are not covered).
 - Log hook start, failures, and timeouts.
 
 Failure semantics:

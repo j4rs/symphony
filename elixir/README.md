@@ -134,8 +134,9 @@ Notes:
   directory left by a failed or interrupted `after_create` is rebuilt on the next dispatch. A long
   `after_create` is bounded by `hooks.timeout_ms`, not by `codex.stall_timeout_ms`.
 - When a hook times out or Symphony abandons a run (stall, terminal state, crashed worker), the
-  hook's and the agent's processes are killed as a process group, including background children.
-  A process that starts its own session (`setsid`) leaves the group and isn't covered.
+  still-running hook and agent processes are killed as process groups, including their background
+  children (local workers on Linux). Not covered: SSH workers, processes that start their own
+  session (`setsid`), and background children of a hook that had already exited.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
