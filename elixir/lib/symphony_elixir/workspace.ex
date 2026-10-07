@@ -32,6 +32,8 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp ensure_workspace(workspace, nil) do
+    adopt_existing_workspaces(Path.dirname(workspace))
+
     cond do
       File.dir?(workspace) and File.exists?(created_marker(workspace)) ->
         {:ok, workspace, false}
@@ -92,17 +94,55 @@ defmodule SymphonyElixir.Workspace do
 
   # A local workspace counts as created only once after_create has completed. The marker lives
   # beside the workspaces, in the workspace root, which the agent's sandbox can't write.
+  @created_markers ".symphony-created"
+
   defp created_marker(workspace) do
-    Path.join([Path.dirname(workspace), ".symphony-created", Path.basename(workspace)])
+    Path.join([Path.dirname(workspace), @created_markers, Path.basename(workspace)])
+  end
+
+  # Workspaces created before markers existed are adopted once, the first time the marker
+  # directory is set up, so upgrading doesn't rebuild (and lose) in-flight workspaces.
+  defp adopt_existing_workspaces(root) do
+    markers = Path.join(root, @created_markers)
+
+    if !File.exists?(markers) and File.dir?(root) do
+      File.mkdir_p!(markers)
+
+      for entry <- File.ls!(root), not String.starts_with?(entry, "."), File.dir?(Path.join(root, entry)) do
+        write_created_marker(Path.join(root, entry))
+      end
+    end
+
+    :ok
+  end
+
+  defp write_created_marker(workspace) do
+    marker = created_marker(workspace)
+    dir = Path.dirname(marker)
+    File.mkdir_p!(dir)
+
+    # Never write through a symlink planted at the marker directory or the marker itself.
+    case File.lstat!(dir) do
+      %File.Stat{type: :directory} -> :ok
+      _ -> raise File.Error, reason: :eexist, action: "use marker directory (not a directory)", path: dir
+    end
+
+    _ = File.rm(marker)
+    File.write!(marker, "", [:exclusive])
   end
 
   defp run_after_create_or_discard(workspace, issue_context, created?, nil) do
     case maybe_run_after_create_hook(workspace, issue_context, created?, nil) do
       :ok ->
-        marker = created_marker(workspace)
-        File.mkdir_p!(Path.dirname(marker))
-        File.write!(marker, "")
-        :ok
+        try do
+          write_created_marker(workspace)
+          :ok
+        rescue
+          error in [File.Error] ->
+            Logger.error("Could not record workspace as created; discarding it workspace=#{workspace} error=#{Exception.message(error)}")
+            File.rm_rf(workspace)
+            {:error, error}
+        end
 
       {:error, _reason} = error ->
         # Never leave a half-built workspace to be reused without after_create.
@@ -394,10 +434,7 @@ defmodule SymphonyElixir.Workspace do
       :timeout ->
         close_port(port)
 
-        if os_pid do
-          OsProcessGroups.terminate(os_pid)
-          OsProcessGroups.unregister(os_pid)
-        end
+        if os_pid, do: OsProcessGroups.kill(os_pid)
 
         :timeout
     end

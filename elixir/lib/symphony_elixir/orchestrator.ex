@@ -682,11 +682,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp stall_elapsed_ms(running_entry, now) do
-    running_entry
-    |> last_activity_timestamp()
-    |> case do
-      %DateTime{} = timestamp ->
+    case {last_activity_timestamp(running_entry), Map.get(running_entry, :started_at)} do
+      {%DateTime{} = timestamp, _started_at} ->
         max(0, DateTime.diff(now, timestamp, :millisecond))
+
+      # Workspace still being created: hooks.timeout_ms is its budget; past it, creation
+      # itself counts as stalled (e.g. something hooks.timeout_ms doesn't bound hangs).
+      {nil, %DateTime{} = started_at} ->
+        max(0, DateTime.diff(now, started_at, :millisecond) - Config.settings!().hooks.timeout_ms)
 
       _ ->
         nil
@@ -694,8 +697,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   # The stall clock starts when the workspace is ready (worker_runtime_info), not at
-  # dispatch: workspace creation runs after_create, which can legitimately take minutes, and
-  # is bounded by hooks.timeout_ms instead. Killing a run mid-after_create orphaned its prep.
+  # dispatch: workspace creation runs after_create, which can legitimately take minutes. Until
+  # then, stall_elapsed_ms only counts time beyond hooks.timeout_ms. Killing a run
+  # mid-after_create orphaned its prep.
   defp last_activity_timestamp(running_entry) when is_map(running_entry) do
     Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :workspace_ready_at)
   end

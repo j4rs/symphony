@@ -129,7 +129,13 @@ Notes:
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
-  `git clone ... .` there, along with any other setup commands you need.
+  `git clone ... .` there, along with any other setup commands you need. A workspace counts as
+  created only once `after_create` completes (recorded in `<workspace.root>/.symphony-created/`); a
+  directory left by a failed or interrupted `after_create` is rebuilt on the next dispatch. A long
+  `after_create` is bounded by `hooks.timeout_ms`, not by `codex.stall_timeout_ms`.
+- When a hook times out or Symphony abandons a run (stall, terminal state, crashed worker), the
+  hook's and the agent's processes are killed as a process group, including background children.
+  A process that starts its own session (`setsid`) leaves the group and isn't covered.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.

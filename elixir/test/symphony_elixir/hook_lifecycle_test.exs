@@ -41,20 +41,62 @@ defmodule SymphonyElixir.HookLifecycleTest do
     refute group_alive?(os_pid)
   end
 
-  test "terminate also handles a process that leads no group, and one already gone" do
-    # The shell prints the pid of a background child: in the shell's group, not a leader.
-    port = Port.open({:spawn_executable, ~c"/bin/sh"}, [:binary, args: [~c"-c", ~c"sleep 60 & echo $!; wait"]])
-    assert_receive {^port, {:data, data}}, 2_000
-    child = data |> String.trim() |> String.to_integer()
-    {:os_pid, leader} = :erlang.port_info(port, :os_pid)
+  test "shutdown kills everything still registered; a process already gone isn't registered" do
+    parent = self()
 
-    assert :ok = OsProcessGroups.terminate(child)
-    {_out, status} = System.cmd("kill", ["-s", "0", "--", "#{child}"], stderr_to_stdout: true)
-    assert status != 0
-    OsProcessGroups.terminate(leader)
+    owner =
+      spawn(fn ->
+        port = Port.open({:spawn_executable, ~c"/bin/sh"}, [:binary, args: [~c"-c", ~c"sleep 60"]])
+        {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
+        OsProcessGroups.register(os_pid)
+        send(parent, {:started, os_pid})
+        Process.sleep(:infinity)
+      end)
 
-    # Nothing left to signal: a no-op.
-    assert :ok = OsProcessGroups.terminate(child)
+    assert_receive {:started, os_pid}, 2_000
+    assert :ok = OsProcessGroups.terminate(:shutdown, nil)
+    refute group_alive?(os_pid)
+    Process.exit(owner, :kill)
+
+    assert :ok = OsProcessGroups.register(2_147_483_000)
+    assert :ets.match_object(OsProcessGroups, {self(), 2_147_483_000, :_}) == []
+  end
+
+  test "a group whose leader is no longer the registered process is never signalled" do
+    port = Port.open({:spawn_executable, ~c"/bin/sh"}, [:binary, args: [~c"-c", ~c"sleep 60"]])
+    {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
+    owner = spawn(fn -> Process.sleep(:infinity) end)
+
+    # As if the pid had been reused since registration: the recorded start time differs.
+    :ets.insert(OsProcessGroups, {owner, os_pid, "not-its-start-time"})
+    OsProcessGroups.kill_owned_by(owner)
+    assert group_alive?(os_pid)
+
+    assert :ok = OsProcessGroups.kill(os_pid)
+    refute group_alive?(os_pid)
+  end
+
+  test "stop lets a group exit by itself before TERM; kill doesn't wait" do
+    root = tmp_root("graceful-stop")
+    File.mkdir_p!(root)
+    termed = Path.join(root, "got-term")
+    script = "trap 'touch #{termed}; exit 0' TERM; sleep 0.5"
+
+    try do
+      port = Port.open({:spawn_executable, ~c"/bin/sh"}, [:binary, args: [~c"-c", String.to_charlist(script)]])
+      {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
+      OsProcessGroups.register(os_pid)
+      assert :ok = OsProcessGroups.stop(os_pid)
+      refute group_alive?(os_pid)
+      refute File.exists?(termed)
+
+      port = Port.open({:spawn_executable, ~c"/bin/sh"}, [:binary, args: [~c"-c", ~c"trap '' TERM; sleep 60"]])
+      {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
+      assert :ok = OsProcessGroups.kill(os_pid)
+      refute group_alive?(os_pid)
+    after
+      File.rm_rf(root)
+    end
   end
 
   test "a timed-out after_create is killed as a group and its workspace discarded" do
@@ -125,12 +167,16 @@ defmodule SymphonyElixir.HookLifecycleTest do
     end
   end
 
-  test "the stall clock starts when the workspace is ready, not at dispatch" do
+  test "the stall clock starts when the workspace is ready; creation has hooks.timeout_ms of budget" do
+    write_workflow_file!(Workflow.workflow_file_path(), hook_timeout_ms: 60_000)
     now = DateTime.utc_now()
-    long_ago = DateTime.add(now, -3_600, :second)
 
-    # Still creating the workspace (after_create running): never stalled.
-    assert Orchestrator.stall_elapsed_ms_for_test(%{started_at: long_ago}, now) == nil
+    # Still creating the workspace, within the hook budget: not stalled at all.
+    assert Orchestrator.stall_elapsed_ms_for_test(%{started_at: DateTime.add(now, -30, :second)}, now) == 0
+
+    # Creation running far past the hook budget does count.
+    long_ago = DateTime.add(now, -3_600, :second)
+    assert Orchestrator.stall_elapsed_ms_for_test(%{started_at: long_ago}, now) in 3_539_000..3_541_000
 
     ready = DateTime.add(now, -10, :second)
     ready_entry = %{started_at: long_ago, workspace_ready_at: ready}
@@ -142,5 +188,46 @@ defmodule SymphonyElixir.HookLifecycleTest do
              %{started_at: long_ago, workspace_ready_at: ready, last_codex_timestamp: codex},
              now
            ) in 1_000..3_000
+  end
+
+  test "workspaces that predate markers are adopted once, not rebuilt" do
+    root = tmp_root("adopt")
+    counter = Path.join(root, "after-create-runs")
+
+    try do
+      File.mkdir_p!(Path.join(root, "MT-903"))
+      File.write!(Path.join([root, "MT-903", "in-flight-work"]), "")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: root,
+        hook_after_create: "echo run >> #{counter}"
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-903")
+      assert File.exists?(Path.join(workspace, "in-flight-work"))
+      refute File.exists?(counter)
+      assert File.exists?(Path.join([root, ".symphony-created", "MT-903"]))
+    after
+      File.rm_rf(root)
+    end
+  end
+
+  test "a symlinked marker directory is refused, not written through" do
+    root = tmp_root("marker-symlink")
+    elsewhere = tmp_root("marker-target")
+
+    try do
+      File.mkdir_p!(root)
+      File.mkdir_p!(elsewhere)
+      File.ln_s!(elsewhere, Path.join(root, ".symphony-created"))
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, hook_after_create: "true")
+
+      assert {:error, _} = Workspace.create_for_issue("MT-904")
+      assert File.ls!(elsewhere) == []
+      refute File.exists?(Path.join(root, "MT-904"))
+    after
+      File.rm_rf(root)
+      File.rm_rf(elsewhere)
+    end
   end
 end

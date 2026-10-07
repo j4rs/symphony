@@ -1035,10 +1035,10 @@ defmodule SymphonyElixir.Codex.AppServer do
   # Port.close/1 only closes the pipes. A codex still starting up (e.g. slow to
   # open ~/.codex sqlite) never reads stdin, never sees EOF, and keeps its
   # state-DB locks, so every retry then dies with "failed to initialize sqlite
-  # state runtime". Kill the port's whole process group (see OsProcessGroups).
+  # state runtime". Stop the port's whole process group (see OsProcessGroups): a
+  # short grace to exit on EOF, then TERM, then KILL.
   defp terminate_os_process_group(os_pid) when is_integer(os_pid) do
-    OsProcessGroups.terminate(os_pid)
-    OsProcessGroups.unregister(os_pid)
+    OsProcessGroups.stop(os_pid)
   end
 
   defp emit_message(on_message, event, details, metadata) when is_function(on_message, 1) do
