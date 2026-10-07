@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, OsProcessGroups, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -21,7 +21,7 @@ defmodule SymphonyElixir.Workspace do
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
-           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+           :ok <- run_after_create_or_discard(workspace, issue_context, created?, worker_host) do
         {:ok, workspace}
       end
     rescue
@@ -33,8 +33,14 @@ defmodule SymphonyElixir.Workspace do
 
   defp ensure_workspace(workspace, nil) do
     cond do
-      File.dir?(workspace) ->
+      File.dir?(workspace) and File.exists?(created_marker(workspace)) ->
         {:ok, workspace, false}
+
+      File.dir?(workspace) ->
+        # No marker: after_create never finished here (it failed, timed out, or Symphony
+        # was stopped mid-prep). Reusing it would skip after_create for good.
+        Logger.warning("Rebuilding incomplete workspace (after_create never completed) workspace=#{workspace}")
+        create_workspace(workspace)
 
       File.exists?(workspace) ->
         File.rm_rf!(workspace)
@@ -84,6 +90,32 @@ defmodule SymphonyElixir.Workspace do
     {:ok, workspace, true}
   end
 
+  # A local workspace counts as created only once after_create has completed. The marker lives
+  # beside the workspaces, in the workspace root, which the agent's sandbox can't write.
+  defp created_marker(workspace) do
+    Path.join([Path.dirname(workspace), ".symphony-created", Path.basename(workspace)])
+  end
+
+  defp run_after_create_or_discard(workspace, issue_context, created?, nil) do
+    case maybe_run_after_create_hook(workspace, issue_context, created?, nil) do
+      :ok ->
+        marker = created_marker(workspace)
+        File.mkdir_p!(Path.dirname(marker))
+        File.write!(marker, "")
+        :ok
+
+      {:error, _reason} = error ->
+        # Never leave a half-built workspace to be reused without after_create.
+        File.rm_rf(workspace)
+        File.rm_rf(created_marker(workspace))
+        error
+    end
+  end
+
+  defp run_after_create_or_discard(workspace, issue_context, created?, worker_host) do
+    maybe_run_after_create_hook(workspace, issue_context, created?, worker_host)
+  end
+
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace), do: remove(workspace, nil)
 
@@ -94,6 +126,7 @@ defmodule SymphonyElixir.Workspace do
         case validate_workspace_path(workspace, nil) do
           :ok ->
             maybe_run_before_remove_hook(workspace, nil)
+            File.rm_rf(created_marker(workspace))
             File.rm_rf(workspace)
 
           {:error, reason} ->
@@ -296,18 +329,11 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
-    task =
-      Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
-      end)
-
-    case Task.yield(task, timeout_ms) do
+    case run_local_hook_command(command, workspace, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
-      nil ->
-        Task.shutdown(task, :brutal_kill)
-
+      :timeout ->
         Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local timeout_ms=#{timeout_ms}")
 
         {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
@@ -329,6 +355,70 @@ defmodule SymphonyElixir.Workspace do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # Runs `sh -lc command` through a port so its OS process group is known: registered with
+  # OsProcessGroups while it runs (an abandoned worker's hook gets killed with it), and killed
+  # as a whole on timeout. System.cmd in a killed Task would leave the shell and everything it
+  # started running.
+  defp run_local_hook_command(command, workspace, timeout_ms) do
+    port =
+      Port.open(
+        {:spawn_executable, String.to_charlist(System.find_executable("sh") || "/bin/sh")},
+        [
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          args: [~c"-lc", String.to_charlist(command)],
+          cd: String.to_charlist(workspace)
+        ]
+      )
+
+    os_pid =
+      case :erlang.port_info(port, :os_pid) do
+        {:os_pid, os_pid} ->
+          OsProcessGroups.register(os_pid)
+          os_pid
+
+        _ ->
+          nil
+      end
+
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    case collect_hook_output(port, [], deadline) do
+      {:exit, output, status} ->
+        if os_pid, do: OsProcessGroups.unregister(os_pid)
+        {:ok, {output, status}}
+
+      :timeout ->
+        close_port(port)
+
+        if os_pid do
+          OsProcessGroups.terminate(os_pid)
+          OsProcessGroups.unregister(os_pid)
+        end
+
+        :timeout
+    end
+  end
+
+  defp collect_hook_output(port, acc, deadline) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^port, {:data, data}} -> collect_hook_output(port, [acc, data], deadline)
+      {^port, {:exit_status, status}} -> {:exit, IO.iodata_to_binary(acc), status}
+    after
+      remaining -> :timeout
+    end
+  end
+
+  defp close_port(port) do
+    Port.close(port)
+    :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   defp handle_hook_command_result({_output, 0}, _workspace, _issue_id, _hook_name) do
